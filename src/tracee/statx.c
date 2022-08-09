@@ -1,4 +1,5 @@
-#include <errno.h>     /* E*, */
+#include <errno.h>          /* E*, */
+#include <sys/sysmacros.h>  /* major, minor, */
 
 #include "tracee/statx.h"
 #include "tracee/mem.h"
@@ -8,6 +9,7 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 	struct statx_syscall_state state = {};
 	char guest_path[PATH_MAX] = {};
 	struct stat stat_buf = {};
+	bool do_fstat = false;
 
 	/* Read arguments and translate path */
 	word_t flags = peek_reg(tracee, regVersion, SYSARG_3);
@@ -27,6 +29,7 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 			return -ENOENT;
 		}
 		status = readlink_proc_pid_fd(tracee->pid, dirfd, state.host_path);
+		do_fstat = true;
 	} else {
 		if (status >= PATH_MAX) {
 			return -ENAMETOOLONG;
@@ -39,12 +42,18 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 
 	if (from_sigsys || peek_reg(tracee, CURRENT, SYSARG_RESULT) != 0) {
 		/* Call [l]stat() on translated path */
-		if (do_lstat) {
+		if (do_fstat) {
+			char link[32] = {}; /* 32 > sizeof("/proc//cwd") + sizeof(#ULONG_MAX) */
+			snprintf(link, sizeof(link), "/proc/%d/fd/%d", tracee->pid, (int) dirfd);
+			status = stat(link, &stat_buf);
+		} else if (do_lstat) {
 			status = lstat(state.host_path, &stat_buf);
 		} else {
 			status = stat(state.host_path, &stat_buf);
 		}
 		if (status < 0) {
+			status = -errno;
+			if (status >= 0) status = -EPERM;
 			return status;
 		}
 
@@ -86,7 +95,7 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 			state.statx_buf.stx_mtime.tv_sec = stat_buf.st_mtim.tv_sec;
 			state.statx_buf.stx_mtime.tv_nsec = stat_buf.st_mtim.tv_nsec;
 		}
-		if (mask & STATX_BTIME) {
+		if (mask & STATX_CTIME) {
 			state.statx_buf.stx_ctime.tv_sec = stat_buf.st_ctim.tv_sec;
 			state.statx_buf.stx_ctime.tv_nsec = stat_buf.st_ctim.tv_nsec;
 		}
@@ -104,6 +113,8 @@ int handle_statx_syscall(Tracee *tracee, bool from_sigsys) {
 			state.statx_buf.stx_btime.tv_sec = stat_buf.st_ctim.tv_sec;
 			state.statx_buf.stx_btime.tv_nsec = stat_buf.st_ctim.tv_nsec;
 		}
+		state.statx_buf.stx_rdev_major = major(stat_buf.st_rdev);
+		state.statx_buf.stx_rdev_minor = minor(stat_buf.st_rdev);
 		state.updated_stats = true;
 	} else {
 		status = read_data(tracee, &state.statx_buf, peek_reg(tracee, ORIGINAL, SYSARG_5), sizeof(struct statx));
